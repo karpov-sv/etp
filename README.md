@@ -7,6 +7,11 @@ ETP is a small Python package that provides a minimal asyncio daemon base class 
 python -m pip install -e .
 ```
 
+Optional InfluxDB support:
+```bash
+python -m pip install -e '.[influx]'
+```
+
 ## Usage
 
 ### Daemon base class
@@ -150,6 +155,43 @@ class BroadcastServer(Daemon):
 ```
 
 Run the full example in `examples/broadcast_server.py` and connect with `nc`.
+
+### Influx ingestion (optional)
+Use the async writer to ingest Line Protocol records from connections. Each line
+should include a timestamp if you want idempotent retries.
+
+```python
+from etp import Daemon
+from etp.influx import AsyncInfluxWriter, InfluxTargetV2
+
+
+class InfluxIngestServer(Daemon):
+    def __init__(self, writer, **kwargs):
+        super().__init__(**kwargs)
+        self.writer = writer
+
+    async def on_start(self):
+        await self.writer.start()
+
+    async def run(self):
+        try:
+            await super().run()
+        finally:
+            await self.writer.close()
+
+    async def handle_incoming(self, reader, writer):
+        del writer
+        while not reader.at_eof():
+            line = await reader.readline()
+            if not line:
+                break
+            payload = line.rstrip(b"\r\n")
+            if payload:
+                await self.writer.write_lp(payload)
+```
+
+See `examples/influx_ingest_server.py` for a complete runnable server with
+InfluxDB v2/v3 CLI configuration.
 
 ### Command parser
 ```python
