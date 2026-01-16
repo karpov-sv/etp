@@ -120,6 +120,37 @@ if __name__ == "__main__":
 
 Try it with the bundled example at `examples/relay_server.py` and a few `nc` sessions.
 
+### Background broadcaster
+This example runs a background task that periodically broadcasts to all connections.
+
+```python
+import asyncio
+
+from etp import Daemon
+
+
+class BroadcastServer(Daemon):
+    def __init__(self, interval=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.interval = interval
+        self._tick = 0
+
+    def on_start(self):
+        self.start_task(self._ticker())
+
+    async def handle_incoming(self, reader, writer):
+        del writer
+        await reader.read()
+
+    async def _ticker(self):
+        while not self.stop_event.is_set():
+            self._tick += 1
+            self.broadcast(f"* tick {self._tick}\\n".encode("utf-8"))
+            await asyncio.sleep(self.interval)
+```
+
+Run the full example in `examples/broadcast_server.py` and connect with `nc`.
+
 ### Command parser
 ```python
 from etp import Command

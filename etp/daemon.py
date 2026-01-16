@@ -71,6 +71,7 @@ class Daemon:
     Minimal reusable asyncio daemon.
 
     Override handle_incoming() and/or handle_outgoing() to implement protocol behavior.
+    Use on_start() to start background tasks with start_task().
     Use self.state for shared data and self.connections for active Connection objects.
     """
 
@@ -91,18 +92,25 @@ class Daemon:
     async def connect(self, host, port, reconnect=False, retry_delay=1.0):
         """Connect to a remote host; optionally keep reconnecting."""
         if reconnect:
-            return self._spawn(self._reconnect_loop(host, port, retry_delay))
+            return self.start_task(self._reconnect_loop(host, port, retry_delay))
         reader, writer = await asyncio.open_connection(host=host, port=port)
-        return self._spawn(self._serve(reader, writer, incoming=False))
+        return self.start_task(self._serve(reader, writer, incoming=False))
 
     def stop(self):
         """Signal the daemon to stop."""
         self.stop_event.set()
 
     async def run(self):
-        """Run until stop() is called, then close server and tasks."""
+        """Run startup hooks, then block until stop() is called and shut down."""
+        result = self.on_start()
+        if asyncio.iscoroutine(result):
+            await result
         await self.stop_event.wait()
         await self._shutdown()
+
+    def on_start(self):
+        """Hook called when run() starts, before waiting on stop_event."""
+        return None
 
     async def handle_incoming(self, reader, writer):
         """
@@ -168,7 +176,7 @@ class Daemon:
                 continue
             self.send(conn, data)
 
-    def _spawn(self, coro):
+    def start_task(self, coro):
         """Schedule a coroutine as a task and track it."""
         task = asyncio.create_task(coro)
         self._tasks.add(task)
@@ -177,7 +185,7 @@ class Daemon:
 
     async def _handle_incoming(self, reader, writer):
         """Handle an incoming connection from the server listener."""
-        self._spawn(self._serve(reader, writer, incoming=True))
+        self.start_task(self._serve(reader, writer, incoming=True))
 
     async def _serve(self, reader, writer, incoming):
         """Register a connection, run its handler, and clean up."""
