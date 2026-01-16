@@ -313,11 +313,18 @@ class AsyncInfluxWriter:
         self._session = aiohttp.ClientSession(timeout=timeout)
         self._task = asyncio.create_task(self._run())
 
-    async def close(self) -> None:
-        """Flush remaining data and close the HTTP session."""
+    async def close(self, drain: bool = True) -> None:
+        """Flush remaining data (unless drain=False) and close the HTTP session."""
         self._stop.set()
         if self._task:
-            await self._task
+            if drain:
+                await self._task
+            else:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
         if self._session:
             await self._session.close()
         self._task = None
@@ -370,6 +377,8 @@ class AsyncInfluxWriter:
                     if response.status in (429,) or 500 <= response.status < 600:
                         raise RuntimeError(f"retryable HTTP {response.status}: {text[:300]}")
                     raise RuntimeError(f"non-retryable HTTP {response.status}: {text[:300]}")
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 if attempt >= self._max_retries:
                     raise

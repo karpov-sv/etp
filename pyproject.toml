@@ -9,7 +9,7 @@ description = "ETPathfinder daemon framework for networking services."
 requires-python = ">=3.8"
 
 [project.optional-dependencies]
-influx = ["aiohttp>=3.8"]
+influx = ["aiohttp>=3.8", "python-decouple>=3.8"]
 
 [tool.setuptools]
 packages = ["etp"]
