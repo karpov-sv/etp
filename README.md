@@ -220,6 +220,21 @@ class ChatDaemon(Daemon):
         self.broadcast(f"* {name} joined\n".encode("utf-8"), exclude=writer)
 ```
 
+### Delimited command reader
+Use `iter_commands` to handle newline- or NUL-delimited command streams.
+
+```python
+from etp import Daemon
+
+
+class CommandDaemon(Daemon):
+    async def handle_incoming(self, reader, writer):
+        async for command in self.iter_commands(reader):
+            await self.send_line(writer, command)
+```
+
+Pass custom `delimiters=(b"\\n", b"\\0")` or `max_buffer=...` if you need tighter limits.
+
 ### Command parser
 ```python
 from etp import Command

@@ -138,3 +138,45 @@ def test_broadcast_helper_writes_to_all():
         await close_connection(task2, writer2)
 
     asyncio.run(scenario())
+
+
+def test_iter_commands_splits_delimiters():
+    async def scenario():
+        daemon = Daemon()
+        loop = asyncio.get_running_loop()
+        (server_reader, _server_writer), (_client_reader, client_writer) = make_memory_stream_pair(loop)
+
+        received = []
+
+        async def consume():
+            async for command in daemon.iter_commands(server_reader):
+                received.append(command)
+
+        task = asyncio.create_task(consume())
+
+        client_writer.write(b"status\nset rate=1\0partial")
+        await asyncio.sleep(0)
+        client_writer.write(b"line\0")
+        client_writer.close()
+
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert received == ["status", "set rate=1", "partialline"]
+
+    asyncio.run(scenario())
+
+
+def test_send_line_helper_writes_newline():
+    async def scenario():
+        daemon = Daemon()
+        loop = asyncio.get_running_loop()
+        (_server_reader, server_writer), (client_reader, client_writer) = make_memory_stream_pair(loop)
+
+        assert await daemon.send_line(server_writer, "hello") is True
+        data = await client_reader.readuntil(b"\n")
+        assert data == b"hello\n"
+
+        server_writer.close()
+        client_writer.close()
+
+    asyncio.run(scenario())

@@ -147,6 +147,82 @@ class Daemon:
                 return conn
         return None
 
+    async def iter_commands(
+        self,
+        reader,
+        delimiters=(b"\n", b"\0"),
+        *,
+        encoding="utf-8",
+        errors="replace",
+        chunk_size=1024,
+        max_buffer=65536,
+    ):
+        """
+        Yield decoded commands delimited by any of the provided byte delimiters.
+
+        Args:
+            reader: asyncio.StreamReader
+            delimiters: Iterable of byte delimiters (e.g., b"\\n", b"\\0")
+            encoding: Text encoding for decoding.
+            errors: Error handling for decoding.
+            chunk_size: Read size per iteration.
+            max_buffer: Max buffered bytes before raising ValueError (None disables).
+        """
+        if not delimiters:
+            raise ValueError("delimiters must not be empty")
+        buffer = b""
+        while not reader.at_eof():
+            chunk = await reader.read(chunk_size)
+            if not chunk:
+                break
+            buffer += chunk
+            if max_buffer is not None and len(buffer) > max_buffer:
+                raise ValueError("command buffer exceeded max_buffer")
+            while True:
+                index, delim_len = self._find_next_delimiter(buffer, delimiters)
+                if index is None:
+                    break
+                line = buffer[:index]
+                buffer = buffer[index + delim_len :]
+                text = line.strip(b"\r").decode(encoding, errors=errors).strip()
+                if text:
+                    yield text
+        if buffer.strip():
+            text = buffer.strip(b"\r").decode(encoding, errors=errors).strip()
+            if text:
+                yield text
+
+    async def send_line(
+        self,
+        target,
+        text,
+        *,
+        encoding="utf-8",
+        errors="replace",
+        newline=b"\n",
+    ):
+        """
+        Send a newline-terminated text message to a Connection or StreamWriter.
+
+        Returns True when the message is queued for sending.
+        """
+        writer = self._resolve_writer(target)
+        if writer is None:
+            return False
+        if hasattr(writer, "is_closing") and writer.is_closing():
+            return False
+        if isinstance(text, bytes):
+            payload = text
+        else:
+            payload = str(text).encode(encoding, errors=errors)
+        if newline:
+            if isinstance(newline, str):
+                newline = newline.encode(encoding, errors=errors)
+            payload += newline
+        writer.write(payload)
+        await writer.drain()
+        return True
+
     def send(self, target, data):
         """Send raw data to a Connection or StreamWriter."""
         writer = self._resolve_writer(target)
@@ -224,6 +300,23 @@ class Daemon:
         if isinstance(target, Connection):
             return target.writer
         return target
+
+    def _find_next_delimiter(self, buffer, delimiters):
+        """Return the earliest delimiter index and its length, or (None, None)."""
+        min_index = None
+        min_len = None
+        for delim in delimiters:
+            if not delim:
+                continue
+            index = buffer.find(delim)
+            if index == -1:
+                continue
+            if min_index is None or index < min_index:
+                min_index = index
+                min_len = len(delim)
+        if min_index is None:
+            return None, None
+        return min_index, min_len
 
     async def _reconnect_loop(self, host, port, retry_delay):
         """Reconnect in a loop until stopped."""
