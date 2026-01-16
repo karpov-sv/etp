@@ -11,8 +11,7 @@ class EchoClient(Daemon):
         super().__init__(**kwargs)
         self.message = message
 
-    async def handle_connection(self, reader, writer, incoming):
-        del incoming
+    async def handle_outgoing(self, reader, writer):
         writer.write((self.message + "\n").encode("utf-8"))
         await writer.drain()
         response = await reader.readline()

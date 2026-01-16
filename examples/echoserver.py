@@ -7,8 +7,7 @@ from etp import Daemon
 
 
 class EchoServer(Daemon):
-    async def handle_connection(self, reader, writer, incoming):
-        del incoming
+    async def handle_incoming(self, reader, writer):
         while not reader.at_eof():
             data = await reader.readline()
             if not data:

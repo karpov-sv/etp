@@ -4,7 +4,7 @@ Minimal asyncio daemon base class.
 Provides:
 - Incoming TCP server support via asyncio.start_server.
 - Outgoing TCP connections with optional reconnect loop.
-- A single overridable handler for all connections.
+- Separate handlers for incoming and outgoing connections.
 - A connection registry with helpers for cross-connection messaging.
 
 Examples:
@@ -15,7 +15,7 @@ Echo server:
     from etp import Daemon
 
     class EchoServer(Daemon):
-        async def handle_connection(self, reader, writer, incoming):
+        async def handle_incoming(self, reader, writer):
             while not reader.at_eof():
                 data = await reader.readline()
                 if not data:
@@ -36,8 +36,7 @@ Echo client:
     from etp import Daemon
 
     class EchoClient(Daemon):
-        async def handle_connection(self, reader, writer, incoming):
-            del incoming
+        async def handle_outgoing(self, reader, writer):
             writer.write(b"hello\\n")
             await writer.drain()
             response = await reader.readline()
@@ -59,6 +58,7 @@ class Connection:
     """Connection wrapper with metadata and per-connection state."""
 
     def __init__(self, reader, writer, incoming):
+        """Initialize a connection wrapper with reader/writer metadata."""
         self.reader = reader
         self.writer = writer
         self.incoming = incoming
@@ -70,11 +70,12 @@ class Daemon:
     """
     Minimal reusable asyncio daemon.
 
-    Override handle_connection() to implement protocol behavior.
+    Override handle_incoming() and/or handle_outgoing() to implement protocol behavior.
     Use self.state for shared data and self.connections for active Connection objects.
     """
 
     def __init__(self, name="", state=None):
+        """Initialize the daemon with a name and shared state."""
         self.name = name
         self.state = {} if state is None else state
         self.connections = []
@@ -103,16 +104,25 @@ class Daemon:
         await self.stop_event.wait()
         await self._shutdown()
 
-    async def handle_connection(self, reader, writer, incoming):
+    async def handle_incoming(self, reader, writer):
         """
-        Override to implement protocol behavior.
+        Override to implement protocol behavior for incoming connections.
 
         Args:
             reader: asyncio.StreamReader
             writer: asyncio.StreamWriter
-            incoming: True if accepted by the server, False if outbound.
         """
-        del reader, writer, incoming
+        del reader, writer
+
+    async def handle_outgoing(self, reader, writer):
+        """
+        Override to implement protocol behavior for outgoing connections.
+
+        Args:
+            reader: asyncio.StreamReader
+            writer: asyncio.StreamWriter
+        """
+        del reader, writer
 
     def on_connect(self, connection):
         """Hook called after a connection is registered."""
@@ -159,22 +169,28 @@ class Daemon:
             self.send(conn, data)
 
     def _spawn(self, coro):
+        """Schedule a coroutine as a task and track it."""
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
 
     async def _handle_incoming(self, reader, writer):
+        """Handle an incoming connection from the server listener."""
         self._spawn(self._serve(reader, writer, incoming=True))
 
     async def _serve(self, reader, writer, incoming):
+        """Register a connection, run its handler, and clean up."""
         connection = Connection(reader, writer, incoming)
         self._register(connection)
         try:
             result = self.on_connect(connection)
             if asyncio.iscoroutine(result):
                 await result
-            await self.handle_connection(reader, writer, incoming)
+            if incoming:
+                await self.handle_incoming(reader, writer)
+            else:
+                await self.handle_outgoing(reader, writer)
         finally:
             result = self.on_disconnect(connection)
             if asyncio.iscoroutine(result):
@@ -184,14 +200,17 @@ class Daemon:
             await writer.wait_closed()
 
     def _register(self, connection):
+        """Add a Connection to the registry if missing."""
         if connection not in self.connections:
             self.connections.append(connection)
 
     def _unregister(self, connection):
+        """Remove a Connection from the registry if present."""
         if connection in self.connections:
             self.connections.remove(connection)
 
     def _resolve_writer(self, target):
+        """Resolve a Connection or StreamWriter into a StreamWriter."""
         if target is None:
             return None
         if isinstance(target, Connection):
@@ -199,6 +218,7 @@ class Daemon:
         return target
 
     async def _reconnect_loop(self, host, port, retry_delay):
+        """Reconnect in a loop until stopped."""
         while not self.stop_event.is_set():
             try:
                 reader, writer = await asyncio.open_connection(host=host, port=port)
@@ -209,6 +229,7 @@ class Daemon:
                 await asyncio.sleep(retry_delay)
 
     async def _shutdown(self):
+        """Close the server and cancel pending tasks."""
         if self._server:
             self._server.close()
             await self._server.wait_closed()

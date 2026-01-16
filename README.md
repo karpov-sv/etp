@@ -16,7 +16,7 @@ from etp import Daemon
 
 
 class EchoServer(Daemon):
-    async def handle_connection(self, reader, writer, incoming):
+    async def handle_incoming(self, reader, writer):
         while not reader.at_eof():
             data = await reader.readline()
             if not data:
@@ -58,8 +58,7 @@ class RelayServer(Daemon):
             del self.by_name[name]
             self.broadcast(f"* {name} left\n".encode("utf-8"))
 
-    async def handle_connection(self, reader, writer, incoming):
-        del incoming
+    async def handle_incoming(self, reader, writer):
         writer.write(b"Enter name: ")
         await writer.drain()
 

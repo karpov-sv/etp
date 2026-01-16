@@ -36,7 +36,7 @@ class MemoryTransport(asyncio.Transport):
 
 
 class HoldDaemon(Daemon):
-    async def handle_connection(self, reader, writer, incoming):
+    async def handle_incoming(self, reader, writer):
         await reader.read()
 
 
