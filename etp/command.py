@@ -1,6 +1,8 @@
 import json
 import shlex
 
+from .influx import build_line_protocol, parse_line_protocol
+
 
 class Command:
     """
@@ -10,6 +12,7 @@ class Command:
     - simple: whitespace tokens with key=value pairs (default).
     - sms: semicolon-delimited tokens (name;key=value;flag).
     - json: JSON object with name/args/kwargs (or list form).
+    - influx: InfluxDB line protocol.
     """
 
     def __init__(self, string=None, format="simple"):
@@ -18,7 +21,7 @@ class Command:
 
         Args:
             string: Raw command text (preserved in self.raw).
-            format: One of "simple", "sms", or "json".
+            format: One of "simple", "sms", "json", or "influx".
         """
         self.name = ""
         self.raw = ""
@@ -73,6 +76,8 @@ class Command:
             self._parse_sms(string)
         elif fmt == "json":
             self._parse_json(string)
+        elif fmt == "influx":
+            self._parse_influx(string)
         else:
             raise ValueError("Unknown command format: %s" % fmt)
 
@@ -81,8 +86,8 @@ class Command:
         Serialize the command back into a string.
 
         Args:
-            format: One of "simple", "sms", or "json". Defaults to the format
-                used for parsing.
+            format: One of "simple", "sms", "json", or "influx". Defaults to
+                the format used for parsing.
         """
         fmt = format or self.format
         if fmt == "simple":
@@ -91,6 +96,8 @@ class Command:
             return self._to_sms()
         if fmt == "json":
             return self._to_json()
+        if fmt == "influx":
+            return self._to_influx()
         raise ValueError("Unknown command format: %s" % fmt)
 
     def _parse_simple(self, string):
@@ -151,6 +158,16 @@ class Command:
         else:
             self.name = str(payload)
 
+    def _parse_influx(self, string):
+        """Parse an InfluxDB line protocol record."""
+        measurement, tags, fields, timestamp = parse_line_protocol(string)
+        self.name = measurement
+        self.args = []
+        self.kwargs = {"tags": tags, "fields": fields}
+        if timestamp is not None:
+            self.kwargs["timestamp"] = timestamp
+        self._parts = []
+
     def _to_simple(self):
         """Serialize to the simple whitespace/key=value format."""
         def escape_token(value):
@@ -209,3 +226,12 @@ class Command:
             **dict(self.kwargs)
         }
         return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+
+    def _to_influx(self):
+        """Serialize to the InfluxDB line protocol format."""
+        tags = self.kwargs.get("tags", {})
+        fields = self.kwargs.get("fields", {})
+        timestamp = self.kwargs.get("timestamp")
+        if timestamp is None and self.args:
+            timestamp = self.args[0]
+        return build_line_protocol(self.name, tags=tags, fields=fields, timestamp=timestamp)

@@ -6,9 +6,12 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass
-from typing import Optional, Union, List, Tuple
+from typing import Optional, Union, List, Tuple, Mapping, Iterable, Any
 
-import aiohttp
+try:
+    import aiohttp
+except ImportError:  # pragma: no cover
+    aiohttp = None
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,239 @@ class InfluxTargetV3:
     base_url: str  # e.g. "http://localhost:8181"
     db: str
     token: str
+
+
+def _escape_key(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace(" ", "\\ ")
+        .replace(",", "\\,")
+        .replace("=", "\\=")
+    )
+
+
+def _escape_field_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _normalize_items(items: Optional[Iterable[Any]]) -> List[Tuple[str, Any]]:
+    if items is None:
+        return []
+    if isinstance(items, Mapping):
+        keys = sorted(items.keys(), key=lambda key: str(key))
+        return [(str(key), items[key]) for key in keys]
+    return [(str(key), value) for key, value in items]
+
+
+def _format_field_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return f"{value}i"
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        return f"\"{_escape_field_string(value)}\""
+    raise TypeError(f"Unsupported field value type: {type(value).__name__}")
+
+
+def build_line_protocol(
+    measurement: str,
+    *,
+    tags: Optional[Iterable[Any]] = None,
+    fields: Optional[Iterable[Any]] = None,
+    timestamp: Optional[Union[int, str]] = None,
+) -> str:
+    """
+    Build a single InfluxDB Line Protocol record.
+
+    Args:
+        measurement: Measurement name.
+        tags: Mapping or iterable of (key, value) pairs for tags.
+        fields: Mapping or iterable of (key, value) pairs for fields.
+        timestamp: Optional timestamp (int or str).
+    """
+    if measurement is None or str(measurement) == "":
+        raise ValueError("measurement is required")
+    field_items = _normalize_items(fields)
+    if not field_items:
+        raise ValueError("fields are required")
+
+    measurement_text = _escape_key(str(measurement))
+    tag_items = _normalize_items(tags)
+
+    tag_part = ",".join(
+        f"{_escape_key(key)}={_escape_key(str(value))}" for key, value in tag_items
+    )
+    field_part = ",".join(
+        f"{_escape_key(key)}={_format_field_value(value)}" for key, value in field_items
+    )
+
+    line = measurement_text
+    if tag_part:
+        line += "," + tag_part
+    line += " " + field_part
+    if timestamp is not None:
+        line += " " + str(timestamp)
+    return line
+
+
+def _unescape(value: str) -> str:
+    out = []
+    escaped = False
+    for ch in value:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        out.append(ch)
+    if escaped:
+        out.append("\\")
+    return "".join(out)
+
+
+def _split_unescaped(value: str, sep: str, *, honor_quotes: bool) -> List[str]:
+    parts: List[str] = []
+    buf: List[str] = []
+    escaped = False
+    in_quotes = False
+    for ch in value:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            buf.append(ch)
+            continue
+        if honor_quotes and ch == '"':
+            in_quotes = not in_quotes
+            buf.append(ch)
+            continue
+        if ch == sep and not in_quotes:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    if escaped:
+        buf.append("\\")
+    parts.append("".join(buf))
+    return parts
+
+
+def _split_first_unescaped(value: str, sep: str, *, honor_quotes: bool) -> Tuple[str, str]:
+    escaped = False
+    in_quotes = False
+    for idx, ch in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if honor_quotes and ch == '"':
+            in_quotes = not in_quotes
+            continue
+        if ch == sep and not in_quotes:
+            return value[:idx], value[idx + 1 :]
+    raise ValueError(f"Missing separator {sep!r} in {value!r}")
+
+
+def _split_fields_and_timestamp(value: str) -> Tuple[str, Optional[str]]:
+    escaped = False
+    in_quotes = False
+    last_space = -1
+    for idx, ch in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_quotes = not in_quotes
+            continue
+        if ch == " " and not in_quotes:
+            last_space = idx
+    if last_space == -1:
+        return value, None
+    return value[:last_space], value[last_space + 1 :]
+
+
+def _parse_field_value(value: str) -> Any:
+    if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+        return _unescape(value[1:-1])
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if value.endswith("i"):
+        number = value[:-1]
+        if number and (number.isdigit() or (number[0] == "-" and number[1:].isdigit())):
+            return int(number)
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def parse_line_protocol(
+    line: Union[str, bytes],
+) -> Tuple[str, dict, dict, Optional[Union[int, str]]]:
+    """
+    Parse a single Line Protocol record into measurement, tags, fields, and timestamp.
+    """
+    if isinstance(line, bytes):
+        text = line.decode("utf-8", errors="replace")
+    else:
+        text = line
+    text = text.rstrip("\r\n")
+    if not text:
+        raise ValueError("line protocol payload is empty")
+
+    measurement_part, rest = _split_first_unescaped(text, " ", honor_quotes=False)
+    rest = rest.strip()
+    if not rest:
+        raise ValueError("line protocol payload missing fields")
+
+    fields_part, timestamp_part = _split_fields_and_timestamp(rest)
+    fields_part = fields_part.strip()
+    if not fields_part:
+        raise ValueError("line protocol payload missing fields")
+
+    measurement_tokens = _split_unescaped(measurement_part, ",", honor_quotes=False)
+    measurement = _unescape(measurement_tokens[0])
+    tags = {}
+    for token in measurement_tokens[1:]:
+        if not token:
+            continue
+        key, value = _split_first_unescaped(token, "=", honor_quotes=False)
+        tags[_unescape(key)] = _unescape(value)
+
+    fields = {}
+    field_tokens = _split_unescaped(fields_part, ",", honor_quotes=True)
+    for token in field_tokens:
+        if not token:
+            continue
+        key, value = _split_first_unescaped(token, "=", honor_quotes=True)
+        fields[_unescape(key)] = _parse_field_value(value)
+
+    timestamp: Optional[Union[int, str]] = None
+    if timestamp_part:
+        timestamp_part = timestamp_part.strip()
+        if timestamp_part:
+            try:
+                timestamp = int(timestamp_part)
+            except ValueError:
+                timestamp = timestamp_part
+
+    return measurement, tags, fields, timestamp
 
 
 class AsyncInfluxWriter:
@@ -60,18 +296,21 @@ class AsyncInfluxWriter:
         self._batch_max_points = batch_max_points
         self._flush_interval_s = flush_interval_s
         self._max_retries = max_retries
+        self._request_timeout_s = request_timeout_s
 
         self._q = asyncio.Queue(maxsize=queue_maxsize)
         self._stop = asyncio.Event()
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._timeout = aiohttp.ClientTimeout(total=request_timeout_s)
+        self._session: Optional[object] = None
         self._task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         """Start the background flushing task."""
         if self._session is not None:
             raise RuntimeError("AsyncInfluxWriter already started")
-        self._session = aiohttp.ClientSession(timeout=self._timeout)
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required; install with etp[influx]")
+        timeout = aiohttp.ClientTimeout(total=self._request_timeout_s)
+        self._session = aiohttp.ClientSession(timeout=timeout)
         self._task = asyncio.create_task(self._run())
 
     async def close(self) -> None:
