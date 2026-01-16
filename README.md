@@ -193,6 +193,33 @@ class InfluxIngestServer(Daemon):
 See `examples/influx_ingest_server.py` for a complete runnable server with
 InfluxDB v2/v3 CLI configuration.
 
+### Shared state between connections
+Use `self.state` for shared data and `connection.state` for per-connection data.
+If multiple tasks mutate the shared state, guard updates with an `asyncio.Lock`.
+
+```python
+import asyncio
+
+from etp import Daemon
+
+
+class ChatDaemon(Daemon):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.state["users"] = {}
+        self._lock = asyncio.Lock()
+
+    def on_connect(self, connection):
+        connection.state["name"] = None
+
+    async def handle_incoming(self, reader, writer):
+        name = (await reader.readline()).decode().strip()
+        async with self._lock:
+            self.state["users"][name] = self.get_connection(writer)
+            self.get_connection(writer).state["name"] = name
+        self.broadcast(f"* {name} joined\n".encode("utf-8"), exclude=writer)
+```
+
 ### Command parser
 ```python
 from etp import Command
