@@ -59,7 +59,7 @@ def _load_influx_writer(debug=False) -> AsyncInfluxWriter:
             token=token,
             precision=precision,
         )
-        return AsyncInfluxWriter(target_v2=target)
+        return AsyncInfluxWriter(target_v2=target, debug=debug)
 
     if version in ("v3", "3"):
         db = config("INFLUX_DB")
@@ -73,13 +73,36 @@ def _load_influx_writer(debug=False) -> AsyncInfluxWriter:
     raise ValueError("INFLUX_VERSION must be v2 or v3")
 
 
+def _parse_tags(values):
+    tags = {}
+    for item in values:
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Tag must be key=value: {item!r}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"Tag key is required: {item!r}")
+        tags[key] = value.strip()
+    return tags
+
+
 class DummyDevice(Daemon):
-    def __init__(self, writer: AsyncInfluxWriter, rate: float, metric_name: str, **kwargs):
-        """Initialize the dummy device with a writer, rate, and metric name."""
+    def __init__(
+        self,
+        writer: AsyncInfluxWriter,
+        rate: float,
+        metric_name: str,
+        tags: Dict[str, str],
+        **kwargs,
+    ):
+        """Initialize the dummy device with a writer, rate, metric name, and tags."""
         super().__init__(**kwargs)
         self.writer = writer
         self._drain_on_shutdown = True
         self.metric_name = metric_name
+        self.tags = dict(tags)
         self.state.update(
             {
                 "rate": rate,
@@ -183,7 +206,7 @@ class DummyDevice(Daemon):
 
             line = build_line_protocol(
                 self.metric_name,
-                tags={"device": device_id},
+                tags={**{"device": device_id}, **self.tags},
                 fields={"value": temperature},
                 timestamp=now_ns,
             )
@@ -206,15 +229,26 @@ async def main():
         help="Metric/parameter name for readings",
     )
     parser.add_argument("--name", default="dummy")
+    parser.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        help="Additional Influx tag key=value (repeatable)",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
+    try:
+        extra_tags = _parse_tags(args.tag)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     writer = _load_influx_writer(debug=args.debug)
-    writer.debug = bool(args.debug)
     daemon = DummyDevice(
         writer,
         rate=args.rate,
         metric_name=args.metric_name,
+        tags=extra_tags,
         name=args.name,
         debug=args.debug,
     )

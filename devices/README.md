@@ -17,7 +17,8 @@ Required `.env` keys:
 
 ### Run
 ```bash
-python devices/dummy.py --host 127.0.0.1 --port 7004 --rate 1.0 --metric-name temperature
+python devices/dummy.py --host 127.0.0.1 --port 7004 --rate 1.0 \
+  --metric-name temperature --tag site=lab --tag rack=3 --debug
 ```
 
 ### Commands
@@ -28,4 +29,6 @@ Connect with `nc` or `client.py` and send newline or NUL terminated commands.
 
 ### Notes
 - `rate` is in readings per second and can be changed at runtime with `set rate=...`.
-- The metric name controls both the status key and the Influx measurement name.
+- `--metric-name` (alias `--parameter-name`) controls the status key and Influx measurement name.
+- `--tag` can be repeated to attach additional Influx tags to each point.
+- `--debug` enables verbose logging from the daemon and Influx writer.
