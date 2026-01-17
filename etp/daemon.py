@@ -52,6 +52,7 @@ Echo client:
 """
 
 import asyncio
+import time
 
 
 class Connection:
@@ -75,10 +76,11 @@ class Daemon:
     Use self.state for shared data and self.connections for active Connection objects.
     """
 
-    def __init__(self, name="", state=None):
-        """Initialize the daemon with a name and shared state."""
+    def __init__(self, name="", state=None, debug=False):
+        """Initialize the daemon with a name, shared state, and debug flag."""
         self.name = name
         self.state = {} if state is None else state
+        self.debug = debug
         self.connections = []
         self._server = None
         self._tasks = set()
@@ -186,10 +188,12 @@ class Daemon:
                 buffer = buffer[index + delim_len :]
                 text = line.strip(b"\r").decode(encoding, errors=errors).strip()
                 if text:
+                    self._debug(f"line received: {text!r}")
                     yield text
         if buffer.strip():
             text = buffer.strip(b"\r").decode(encoding, errors=errors).strip()
             if text:
+                self._debug(f"line received: {text!r}")
                 yield text
 
     async def send_line(
@@ -219,6 +223,7 @@ class Daemon:
             if isinstance(newline, str):
                 newline = newline.encode(encoding, errors=errors)
             payload += newline
+        self._debug(f"send line: {payload!r}")
         writer.write(payload)
         await writer.drain()
         return True
@@ -267,6 +272,9 @@ class Daemon:
         """Register a connection, run its handler, and clean up."""
         connection = Connection(reader, writer, incoming)
         self._register(connection)
+        self._debug(
+            f"connection established incoming={incoming} peer={connection.peername}"
+        )
         try:
             result = self.on_connect(connection)
             if asyncio.iscoroutine(result):
@@ -280,6 +288,9 @@ class Daemon:
             if asyncio.iscoroutine(result):
                 await result
             self._unregister(connection)
+            self._debug(
+                f"connection disconnected incoming={incoming} peer={connection.peername}"
+            )
             writer.close()
             await writer.wait_closed()
 
@@ -300,6 +311,14 @@ class Daemon:
         if isinstance(target, Connection):
             return target.writer
         return target
+
+    def _debug(self, message):
+        """Print a timestamped debug message when debug is enabled."""
+        if not self.debug:
+            return
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        prefix = f"{self.name} " if self.name else ""
+        print(f"[{timestamp}] {prefix}{message}")
 
     def _find_next_delimiter(self, buffer, delimiters):
         """Return the earliest delimiter index and its length, or (None, None)."""

@@ -286,6 +286,7 @@ class AsyncInfluxWriter:
         queue_maxsize: int = 200_000,
         request_timeout_s: float = 10.0,
         max_retries: int = 8,
+        debug: bool = False,
     ):
         """Initialize the writer with target selection and batching settings."""
         if (target_v2 is None) == (target_v3 is None):
@@ -297,6 +298,7 @@ class AsyncInfluxWriter:
         self._flush_interval_s = flush_interval_s
         self._max_retries = max_retries
         self._request_timeout_s = request_timeout_s
+        self.debug = debug
 
         self._q = asyncio.Queue(maxsize=queue_maxsize)
         self._stop = asyncio.Event()
@@ -312,6 +314,7 @@ class AsyncInfluxWriter:
         timeout = aiohttp.ClientTimeout(total=self._request_timeout_s)
         self._session = aiohttp.ClientSession(timeout=timeout)
         self._task = asyncio.create_task(self._run())
+        self._debug("writer started")
 
     async def close(self, drain: bool = True) -> None:
         """Flush remaining data (unless drain=False) and close the HTTP session."""
@@ -329,6 +332,7 @@ class AsyncInfluxWriter:
             await self._session.close()
         self._task = None
         self._session = None
+        self._debug(f"writer closed drain={drain}")
 
     async def write_lp(self, line: Union[str, bytes]) -> None:
         """
@@ -372,6 +376,7 @@ class AsyncInfluxWriter:
             try:
                 async with self._session.post(url, data=body, headers=headers) as response:
                     if 200 <= response.status < 300:
+                        self._debug(f"write ok status={response.status} bytes={len(body)}")
                         return
                     text = await response.text()
                     if response.status in (429,) or 500 <= response.status < 600:
@@ -381,7 +386,9 @@ class AsyncInfluxWriter:
                 raise
             except Exception:
                 if attempt >= self._max_retries:
+                    self._debug("write failed after retries")
                     raise
+                self._debug(f"write retry attempt={attempt + 1}")
                 await asyncio.sleep(delay + random.random() * 0.25)
                 delay = min(delay * 2, 8.0)
 
@@ -394,6 +401,7 @@ class AsyncInfluxWriter:
             nonlocal buf, last_flush
             if not buf:
                 return
+            self._debug(f"flush points={len(buf)}")
             body = b"\n".join(buf) + b"\n"
             buf = []
             last_flush = time.monotonic()
@@ -413,3 +421,10 @@ class AsyncInfluxWriter:
                 await flush()
 
         await flush()
+
+    def _debug(self, message: str) -> None:
+        """Print a timestamped debug message when debug is enabled."""
+        if not self.debug:
+            return
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] influx {message}")
