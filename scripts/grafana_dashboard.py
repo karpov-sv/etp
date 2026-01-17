@@ -163,17 +163,99 @@ def upload_dashboard(
     return response.json()
 
 
+def delete_dashboard(
+    base_url: str,
+    token: str,
+    uid: str,
+    *,
+    verify: bool = True,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    """Delete a dashboard by UID."""
+    url = _join_url(base_url, f"/api/dashboards/uid/{uid}")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    response = requests.delete(url, headers=headers, timeout=timeout, verify=verify)
+    if response.status_code not in (200, 202):
+        raise RuntimeError(f"DELETE {url} failed: {response.status_code} {response.text[:500]}")
+    return response.json()
+
+
 def _ensure_token(token: Optional[str]) -> str:
     if not token:
         raise RuntimeError("Missing token. Pass --token or set GRAFANA_TOKEN.")
     return token
 
 
+def _resolve_dashboard_uid(
+    base_url: str,
+    token: str,
+    name: str,
+    *,
+    folder_id: Optional[int] = None,
+    verify: bool = True,
+    timeout: int = 30,
+) -> str:
+    params: Dict[str, Any] = {"type": "dash-db", "query": name}
+    if folder_id is not None:
+        params["folderIds"] = str(folder_id)
+    items = get_json(base_url, token, "/api/search", params=params, verify=verify, timeout=timeout)
+    matches = [item for item in items if item.get("title") == name]
+    if not matches and items:
+        matches = items
+    if not matches:
+        raise RuntimeError(f"No dashboards found matching name {name!r}")
+    if len(matches) > 1:
+        summary = ", ".join(
+            f"{item.get('title')} (uid={item.get('uid')}, folder={item.get('folderTitle')})"
+            for item in matches[:5]
+        )
+        raise RuntimeError(f"Multiple dashboards match name {name!r}: {summary}")
+    uid = matches[0].get("uid")
+    if not uid:
+        raise RuntimeError(f"Dashboard match is missing uid for name {name!r}")
+    return uid
+
+
+def _dashboard_uid_from_args(
+    base_url: str,
+    token: str,
+    args: argparse.Namespace,
+    *,
+    verify: bool,
+    timeout: int,
+) -> str:
+    uid = getattr(args, "uid", None)
+    if uid is not None:
+        return uid
+    name = getattr(args, "name", None)
+    if name is not None:
+        folder_id = getattr(args, "folder_id", None)
+        return _resolve_dashboard_uid(
+            base_url,
+            token,
+            name,
+            folder_id=folder_id,
+            verify=verify,
+            timeout=timeout,
+        )
+    raise RuntimeError("Provide --uid or --name for the dashboard.")
+
+
 def _download_command(args: argparse.Namespace) -> int:
     token = _ensure_token(args.token)
     verify = not args.no_verify_ssl
 
-    blob = fetch_dashboard(args.base_url, token, args.uid, verify=verify, timeout=args.timeout)
+    uid = _dashboard_uid_from_args(
+        args.base_url,
+        token,
+        args,
+        verify=verify,
+        timeout=args.timeout,
+    )
+    blob = fetch_dashboard(args.base_url, token, uid, verify=verify, timeout=args.timeout)
     if "dashboard" not in blob:
         print(f"ERROR: unexpected response keys: {list(blob.keys())}", file=sys.stderr)
         return 3
@@ -191,7 +273,7 @@ def _download_command(args: argparse.Namespace) -> int:
             strip_panel_ids=args.strip_panel_ids,
         )
 
-    out_path = Path(args.out or f"dashboard_{args.uid}.json")
+    out_path = Path(args.out or f"dashboard_{uid}.json")
     write_pretty_json(out_path, cleaned)
 
     if args.out_payload:
@@ -260,6 +342,106 @@ def _tags_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _folder_command(args: argparse.Namespace) -> int:
+    token = _ensure_token(args.token)
+    verify = not args.no_verify_ssl
+
+    folder = get_json(
+        args.base_url,
+        token,
+        f"/api/folders/{args.uid}",
+        verify=verify,
+        timeout=args.timeout,
+    )
+    print(json.dumps(folder, indent=2))
+    return 0
+
+
+def _dashboard_permissions_command(args: argparse.Namespace) -> int:
+    token = _ensure_token(args.token)
+    verify = not args.no_verify_ssl
+
+    uid = _dashboard_uid_from_args(
+        args.base_url,
+        token,
+        args,
+        verify=verify,
+        timeout=args.timeout,
+    )
+    perms = get_json(
+        args.base_url,
+        token,
+        f"/api/dashboards/uid/{uid}/permissions",
+        verify=verify,
+        timeout=args.timeout,
+    )
+    print(json.dumps(perms, indent=2))
+    return 0
+
+
+def _folder_permissions_command(args: argparse.Namespace) -> int:
+    token = _ensure_token(args.token)
+    verify = not args.no_verify_ssl
+
+    perms = get_json(
+        args.base_url,
+        token,
+        f"/api/folders/{args.uid}/permissions",
+        verify=verify,
+        timeout=args.timeout,
+    )
+    print(json.dumps(perms, indent=2))
+    return 0
+
+
+def _versions_command(args: argparse.Namespace) -> int:
+    token = _ensure_token(args.token)
+    verify = not args.no_verify_ssl
+
+    uid = _dashboard_uid_from_args(
+        args.base_url,
+        token,
+        args,
+        verify=verify,
+        timeout=args.timeout,
+    )
+    params: Dict[str, Any] = {}
+    if args.limit is not None:
+        params["limit"] = args.limit
+    if args.start is not None:
+        params["start"] = args.start
+
+    versions = get_json(
+        args.base_url,
+        token,
+        f"/api/dashboards/uid/{uid}/versions",
+        params=params,
+        verify=verify,
+        timeout=args.timeout,
+    )
+    print(json.dumps(versions, indent=2))
+    return 0
+
+
+def _delete_command(args: argparse.Namespace) -> int:
+    token = _ensure_token(args.token)
+    verify = not args.no_verify_ssl
+
+    if not args.force:
+        raise RuntimeError("Refusing to delete without --force")
+
+    uid = _dashboard_uid_from_args(
+        args.base_url,
+        token,
+        args,
+        verify=verify,
+        timeout=args.timeout,
+    )
+    result = delete_dashboard(args.base_url, token, uid, verify=verify, timeout=args.timeout)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def _upload_command(args: argparse.Namespace) -> int:
     token = _ensure_token(args.token)
     verify = not args.no_verify_ssl
@@ -309,8 +491,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    download = subparsers.add_parser("download", help="Download a dashboard by UID")
-    download.add_argument("--uid", required=True, help="Dashboard UID (from the dashboard URL)")
+    download = subparsers.add_parser("download", help="Download a dashboard by UID or name")
+    download_lookup = download.add_mutually_exclusive_group(required=True)
+    download_lookup.add_argument("--uid", help="Dashboard UID (from the dashboard URL)")
+    download_lookup.add_argument("--name", help="Dashboard title to search for")
+    download.add_argument("--folder-id", type=int, default=None, help="Folder id for name lookup")
     download.add_argument("--out", default=None, help="Output file for dashboard JSON")
     download.add_argument("--out-payload", default=None, help="Output file for POST payload JSON")
     download.add_argument("--no-clean", action="store_true", help="Do not modify dashboard JSON")
@@ -338,6 +523,38 @@ def build_parser() -> argparse.ArgumentParser:
     tags.add_argument("--query", default=None, help="Search query")
     tags.add_argument("--limit", type=int, default=None, help="Limit result size")
     tags.set_defaults(func=_tags_command)
+
+    folder = subparsers.add_parser("folder", help="Get folder by UID")
+    folder.add_argument("--uid", required=True, help="Folder UID")
+    folder.set_defaults(func=_folder_command)
+
+    permissions = subparsers.add_parser("permissions", help="Get dashboard permissions by UID or name")
+    permissions_lookup = permissions.add_mutually_exclusive_group(required=True)
+    permissions_lookup.add_argument("--uid", help="Dashboard UID")
+    permissions_lookup.add_argument("--name", help="Dashboard title to search for")
+    permissions.add_argument("--folder-id", type=int, default=None, help="Folder id for name lookup")
+    permissions.set_defaults(func=_dashboard_permissions_command)
+
+    folder_permissions = subparsers.add_parser("folder-permissions", help="Get folder permissions by UID")
+    folder_permissions.add_argument("--uid", required=True, help="Folder UID")
+    folder_permissions.set_defaults(func=_folder_permissions_command)
+
+    versions = subparsers.add_parser("versions", help="List dashboard versions by UID or name")
+    versions_lookup = versions.add_mutually_exclusive_group(required=True)
+    versions_lookup.add_argument("--uid", help="Dashboard UID")
+    versions_lookup.add_argument("--name", help="Dashboard title to search for")
+    versions.add_argument("--folder-id", type=int, default=None, help="Folder id for name lookup")
+    versions.add_argument("--limit", type=int, default=None, help="Limit result size")
+    versions.add_argument("--start", type=int, default=None, help="Start offset")
+    versions.set_defaults(func=_versions_command)
+
+    delete = subparsers.add_parser("delete", help="Delete a dashboard by UID or name")
+    delete_lookup = delete.add_mutually_exclusive_group(required=True)
+    delete_lookup.add_argument("--uid", help="Dashboard UID")
+    delete_lookup.add_argument("--name", help="Dashboard title to search for")
+    delete.add_argument("--folder-id", type=int, default=None, help="Folder id for name lookup")
+    delete.add_argument("--force", action="store_true", help="Confirm deletion")
+    delete.set_defaults(func=_delete_command)
 
     upload = subparsers.add_parser("upload", help="Upload a dashboard payload or JSON")
     upload.add_argument("--payload", default=None, help="Payload JSON file for POST /api/dashboards/db")
