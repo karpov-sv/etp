@@ -300,38 +300,56 @@ class AsyncInfluxWriter:
         self._request_timeout_s = request_timeout_s
         self.debug = debug
 
+        self._queue_maxsize = queue_maxsize
         self._q = asyncio.Queue(maxsize=queue_maxsize)
         self._stop = asyncio.Event()
+        self._running = False
+        self._last_error = None
         self._session: Optional[object] = None
         self._task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         """Start the background flushing task."""
-        if self._session is not None:
+        if self._task is not None and not self._task.done():
             raise RuntimeError("AsyncInfluxWriter already started")
         if aiohttp is None:
             raise RuntimeError("aiohttp is required; install with etp[influx]")
+        # Clean up any leftover session from a prior start attempt.
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+        # Reset stop flag and queue so restarts behave like a fresh writer.
+        self._stop = asyncio.Event()
+        self._q = asyncio.Queue(maxsize=self._queue_maxsize)
+        self._last_error = None
         timeout = aiohttp.ClientTimeout(total=self._request_timeout_s)
         self._session = aiohttp.ClientSession(timeout=timeout)
         self._task = asyncio.create_task(self._run())
+        self._running = True
         self._debug("writer started")
 
     async def close(self, drain: bool = True) -> None:
         """Flush remaining data (unless drain=False) and close the HTTP session."""
         self._stop.set()
         if self._task:
-            if drain:
-                await self._task
-            else:
-                self._task.cancel()
-                try:
+            try:
+                if drain:
+                    # Drain mode: let the background task flush remaining data.
                     await self._task
-                except asyncio.CancelledError:
-                    pass
+                else:
+                    # Fast mode: cancel the background task and drop buffered data.
+                    self._task.cancel()
+                    await self._task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self._last_error = exc
+                self._debug(f"writer task error during close: {exc!r}")
         if self._session:
             await self._session.close()
         self._task = None
         self._session = None
+        self._running = False
         self._debug(f"writer closed drain={drain}")
 
     async def write_lp(self, line: Union[str, bytes]) -> None:
@@ -340,6 +358,12 @@ class AsyncInfluxWriter:
 
         For idempotent retries, include a timestamp in each record.
         """
+        # Refuse writes when the worker is not running or already shut down.
+        if self._task is None or self._session is None or self._task.done():
+            raise RuntimeError("AsyncInfluxWriter not started")
+        # Refuse writes once shutdown has begun to avoid hanging drains.
+        if self._stop.is_set():
+            raise RuntimeError("AsyncInfluxWriter is stopping")
         if isinstance(line, str):
             payload = line.encode("utf-8")
         else:
@@ -376,15 +400,19 @@ class AsyncInfluxWriter:
             try:
                 async with self._session.post(url, data=body, headers=headers) as response:
                     if 200 <= response.status < 300:
+                        # Success path: Influx usually returns 204 for writes.
                         self._debug(f"write ok status={response.status} bytes={len(body)}")
                         return
                     text = await response.text()
                     if response.status in (429,) or 500 <= response.status < 600:
+                        # Retry on throttling or server-side errors.
                         raise RuntimeError(f"retryable HTTP {response.status}: {text[:300]}")
+                    # Fail fast on most 4xx errors (auth or bad line protocol).
                     raise RuntimeError(f"non-retryable HTTP {response.status}: {text[:300]}")
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # Exponential backoff with jitter until retries are exhausted.
                 if attempt >= self._max_retries:
                     self._debug("write failed after retries")
                     raise
@@ -405,22 +433,40 @@ class AsyncInfluxWriter:
             body = b"\n".join(buf) + b"\n"
             buf = []
             last_flush = time.monotonic()
-            await self._post_with_retries(body)
-
-        while True:
-            if self._stop.is_set() and self._q.empty():
-                break
-
-            timeout = max(0.0, self._flush_interval_s - (time.monotonic() - last_flush))
             try:
-                item = await asyncio.wait_for(self._q.get(), timeout=timeout)
-                buf.append(item)
-                if len(buf) >= self._batch_max_points:
-                    await flush()
-            except asyncio.TimeoutError:
-                await flush()
+                await self._post_with_retries(body)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Drop the failed batch but keep the loop alive for future writes.
+                self._last_error = exc
+                self._debug(f"flush failed: {exc!r}")
+                await asyncio.sleep(self._flush_interval_s)
 
-        await flush()
+        try:
+            while True:
+                # Exit once shutdown is requested and the queue is drained.
+                if self._stop.is_set() and self._q.empty():
+                    break
+
+                timeout = max(0.0, self._flush_interval_s - (time.monotonic() - last_flush))
+                try:
+                    item = await asyncio.wait_for(self._q.get(), timeout=timeout)
+                    buf.append(item)
+                    # Flush immediately when the batch reaches its max size.
+                    if len(buf) >= self._batch_max_points:
+                        await flush()
+                except asyncio.TimeoutError:
+                    # Timeout means "flush interval elapsed" or "idle interval elapsed".
+                    if buf:
+                        await flush()
+                    else:
+                        # Reset the idle timer to avoid a zero-timeout spin loop.
+                        last_flush = time.monotonic()
+            await flush()
+        finally:
+            # Ensure running state is cleared on normal exit or exception.
+            self._running = False
 
     def _debug(self, message: str) -> None:
         """Print a timestamped debug message when debug is enabled."""
