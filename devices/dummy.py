@@ -43,7 +43,7 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
-def _load_influx_writer() -> AsyncInfluxWriter:
+def _load_influx_writer(debug=False) -> AsyncInfluxWriter:
     version = config("INFLUX_VERSION", default="v2").strip().lower()
     base_url = config("INFLUX_BASE_URL")
     token = config("INFLUX_TOKEN")
@@ -68,7 +68,7 @@ def _load_influx_writer() -> AsyncInfluxWriter:
             db=db,
             token=token,
         )
-        return AsyncInfluxWriter(target_v3=target)
+        return AsyncInfluxWriter(target_v3=target, debug=debug)
 
     raise ValueError("INFLUX_VERSION must be v2 or v3")
 
@@ -206,10 +206,18 @@ async def main():
         help="Metric/parameter name for readings",
     )
     parser.add_argument("--name", default="dummy")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
-    writer = _load_influx_writer()
-    daemon = DummyDevice(writer, rate=args.rate, metric_name=args.metric_name, name=args.name)
+    writer = _load_influx_writer(debug=args.debug)
+    writer.debug = bool(args.debug)
+    daemon = DummyDevice(
+        writer,
+        rate=args.rate,
+        metric_name=args.metric_name,
+        name=args.name,
+        debug=args.debug,
+    )
     await daemon.listen(host=args.host, port=args.port)
     print(f"Listening on {args.host}:{args.port} (rate={args.rate}s)")
     await daemon.run()
