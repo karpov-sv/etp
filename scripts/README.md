@@ -105,3 +105,51 @@ python scripts/grafana_dashboard.py \
 - `--no-verify-ssl` disables TLS verification if you are using self-signed certs.
 - Download uses a conservative cleanup by default to keep dashboards portable.
 - Commands that accept `--name` support `--folder-id` to disambiguate duplicates.
+
+## Grafana Dashboard Edit Utility
+`grafana_dashboard_edit.py` manipulates panels inside a dashboard JSON file.
+It expects a top-level `panels` list (grid layout dashboards).
+
+### List panels
+```bash
+python scripts/grafana_dashboard_edit.py \
+  --input dashboard_abcdEFGh.json \
+  list
+```
+
+### Duplicate a panel
+```bash
+python scripts/grafana_dashboard_edit.py \
+  --input dashboard_abcdEFGh.json \
+  duplicate --id 12 --dy 8 --output dashboard_abcdEFGh.copy.json
+```
+
+### Move or resize a panel
+```bash
+python scripts/grafana_dashboard_edit.py \
+  --input dashboard_abcdEFGh.json \
+  move --title "CPU Load" --x 0 --y 0 --w 12 --h 8 --in-place
+```
+
+### Swap two panels
+```bash
+python scripts/grafana_dashboard_edit.py \
+  --input dashboard_abcdEFGh.json \
+  swap --a-id 3 --b-id 4 --output dashboard_abcdEFGh.swap.json
+```
+
+### Reflow and normalize ids
+```bash
+python scripts/grafana_dashboard_edit.py \
+  --input dashboard_abcdEFGh.json \
+  reflow --padding 1 --in-place
+
+python scripts/grafana_dashboard_edit.py \
+  --input dashboard_abcdEFGh.json \
+  normalize-ids --in-place
+```
+
+### Notes
+- Write commands require `--output` or `--in-place`.
+- The editor works with plain dashboard JSON or payloads that include a `dashboard` key.
+- Row panels are supported; nested panels show a `rowPath` in JSON output.
