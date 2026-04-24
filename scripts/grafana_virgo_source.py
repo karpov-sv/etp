@@ -3,7 +3,7 @@
 Serves time series pulled from a virgotools FrameFile (default source: 'trend').
 Designed to be queried by the Grafana Infinity datasource with an API-style URL:
 
-    /series?names=M1:a,M1:b&from=<unix_ms>&to=<unix_ms>&step=<s>
+    /series?names=M1:a,M1:b&from=<unix_ms>&to=<unix_ms>&step_ms=<ms>
 
 Response is a list of rows:
 
@@ -29,20 +29,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 
-def _load_deps():
-    try:
-        import numpy as np
-        from astropy.time import Time
-        from virgotools import FrameFile
-        from virgotools.frame_lib import ChannelNotFound
-    except ImportError as exc:
-        sys.exit(
-            f"error: {exc}\n"
-            "This script needs the igwn conda env:\n"
-            "  source /cvmfs/software.igwn.org/conda/etc/profile.d/conda.sh\n"
-            "  conda activate igwn"
-        )
-    return np, Time, FrameFile, ChannelNotFound
+try:
+    import numpy as np
+    from astropy.time import Time
+    from virgotools import FrameFile, getChannel
+    from virgotools.frame_lib import ChannelNotFound
+except ImportError as exc:
+    sys.exit(
+        f"error: {exc}\n"
+        "This script needs the igwn conda env:\n"
+        "  source /cvmfs/software.igwn.org/conda/etc/profile.d/conda.sh\n"
+        "  conda activate igwn"
+    )
 
 
 def _load_channels_file(path):
@@ -52,11 +50,11 @@ def _load_channels_file(path):
         return [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
 
-def unix_ms_to_gps(Time, ms):
+def unix_ms_to_gps(ms):
     return float(Time(ms / 1000.0, format="unix").gps)
 
 
-def rebin(np, values, native_dt, gps_start, step_s):
+def rebin(values, native_dt, gps_start, step_s):
     """Block-average `values` into bins of `step_s` seconds.
 
     Returns (timestamps_ms, averaged_values). If step_s <= native_dt, returns
@@ -66,9 +64,15 @@ def rebin(np, values, native_dt, gps_start, step_s):
     if n == 0:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
 
+    # GPS epoch is 1980-01-06 00:00:00 UTC. Leap seconds separate GPS from UTC.
+    # Converting per-sample via astropy is slow; do it once on the endpoint and
+    # apply the same offset to every sample within a response (safe: leap seconds
+    # can't be inserted inside a single request's time window for trend data).
+    gps_offset = float(Time(gps_start, format="gps").unix) - gps_start
+
     if step_s <= native_dt:
         t_gps = gps_start + np.arange(n, dtype=np.float64) * native_dt
-        return _gps_to_unix_ms(np, t_gps), values.astype(np.float64, copy=False)
+        return (1000 * (t_gps + gps_offset)).astype(np.int64, copy=False), values.astype(np.float64, copy=False)
 
     samples_per_bin = max(1, int(round(step_s / native_dt)))
     trimmed = n - (n % samples_per_bin)
@@ -76,47 +80,21 @@ def rebin(np, values, native_dt, gps_start, step_s):
         # not even one full bin — return a single-point bin of the mean
         bin_means = np.array([np.nanmean(values)], dtype=np.float64)
         t_gps = np.array([gps_start + (n * native_dt) / 2.0], dtype=np.float64)
-        return _gps_to_unix_ms(np, t_gps), bin_means
+        return (1000 * (t_gps + gps_offset)).astype(np.int64, copy=False), bin_means
 
     reshaped = values[:trimmed].reshape(-1, samples_per_bin).astype(np.float64, copy=False)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         bin_means = np.nanmean(reshaped, axis=1)
+
     bin_dt = samples_per_bin * native_dt
     t_gps = gps_start + (np.arange(bin_means.shape[0], dtype=np.float64) + 0.5) * bin_dt
-    return _gps_to_unix_ms(np, t_gps), bin_means
-
-
-# GPS epoch is 1980-01-06 00:00:00 UTC. Leap seconds separate GPS from UTC.
-# Converting per-sample via astropy is slow; do it once on the endpoints and
-# apply the same offset to every sample within a response (safe: leap seconds
-# can't be inserted inside a single request's time window for trend data).
-_GPS_TO_UNIX_OFFSET_S = [None]
-
-
-def _gps_to_unix_ms(np, t_gps):
-    offset = _GPS_TO_UNIX_OFFSET_S[0]
-    if offset is None:
-        raise RuntimeError("GPS-to-UNIX offset not initialised")
-    unix_s = t_gps + offset
-    return (unix_s * 1000.0).astype(np.int64, copy=False)
-
-
-def _init_gps_offset(Time, gps_mid):
-    unix_s = float(Time(gps_mid, format="gps").unix)
-    _GPS_TO_UNIX_OFFSET_S[0] = unix_s - gps_mid
+    return (1000 * (t_gps + gps_offset)).astype(np.int64, copy=False), bin_means
 
 
 class VirgoSource:
     def __init__(self, source_name, channels_file, max_points):
-        self._np, self._Time, FrameFile, self._ChannelNotFound = _load_deps()
-        print(f"[{time.strftime('%H:%M:%S')}] opening FrameFile({source_name!r}) ...",
-              flush=True)
-        t0 = time.time()
-        self.ff = FrameFile(source_name)
-        print(f"[{time.strftime('%H:%M:%S')}] opened in {time.time()-t0:.1f}s; "
-              f"gps_start={self.ff.gps_start} gps_end={self.ff.gps_end}", flush=True)
-        _init_gps_offset(self._Time, (self.ff.gps_start + self.ff.gps_end) / 2)
+        print(f"[{time.strftime('%H:%M:%S')}] Will serve data from {source_name!r}", flush=True)
         self.source_name = source_name
         self.channels = _load_channels_file(channels_file)
         self._channel_set = set(self.channels)
@@ -127,11 +105,14 @@ class VirgoSource:
         dur = max(gps_end - gps_start, 0.0)
         if dur == 0:
             return []
+
+        # Serialise: the underlying C code is not documented as thread-safe.
         with self._lock:
             try:
-                vect = self.ff.getChannel(name, gps_start, dur)
-            except self._ChannelNotFound:
+                vect = getChannel(self.source_name, name, gps_start, dur)
+            except ChannelNotFound:
                 raise
+
         native_dt = float(vect.dt)
         v_gps = float(vect.gps)
         # Enforce the max_points cap by bumping step_s up if needed.
@@ -142,10 +123,10 @@ class VirgoSource:
             if projected > self.max_points:
                 effective_step = dur / self.max_points
                 step_s = effective_step
-        t_ms, values = rebin(self._np, vect.data, native_dt, v_gps, step_s)
+        t_ms, values = rebin(vect.data, native_dt, v_gps, step_s)
         rows = []
         for t, v in zip(t_ms, values):
-            if self._np.isnan(v):
+            if np.isnan(v):
                 continue
             rows.append({"time": int(t), "name": name, "value": float(v)})
         return rows
@@ -167,6 +148,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _error(self, status, message):
+        self.log_message("Error: %s", message)
         self._send_json(status, {"error": message})
 
     def do_GET(self):  # noqa: N802
@@ -176,11 +158,12 @@ class Handler(BaseHTTPRequestHandler):
         src = self.server.source
 
         if path == "/health":
+            ff = FrameFile(src.source_name)
             self._send_json(200, {
                 "status": "ok",
                 "source": src.source_name,
-                "gps_start": src.ff.gps_start,
-                "gps_end": src.ff.gps_end,
+                "gps_start": ff.gps_start,
+                "gps_end": ff.gps_end,
                 "channels": len(src.channels),
             })
             return
@@ -226,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
             t1_ms = int((query.get("to") or [int(time.time() * 1000)])[0])
             default_from = t1_ms - 3600_000
             t0_ms = int((query.get("from") or [default_from])[0])
-            step_s = float((query.get("step") or ["0"])[0])
+            step_s = float((query.get("step_ms") or ["0"])[0])/1000
         except (TypeError, ValueError) as exc:
             self._error(400, f"invalid numeric parameter: {exc}")
             return
@@ -235,8 +218,8 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, "'to' must be greater than 'from'")
             return
 
-        gps_start = unix_ms_to_gps(src._Time, t0_ms)
-        gps_end = unix_ms_to_gps(src._Time, t1_ms)
+        gps_start = unix_ms_to_gps(t0_ms)
+        gps_end = unix_ms_to_gps(t1_ms)
         # If step not given, target ~1000 points over the window.
         if step_s <= 0:
             step_s = max((gps_end - gps_start) / 1000.0, 0.001)
@@ -245,7 +228,7 @@ class Handler(BaseHTTPRequestHandler):
         for name in names:
             try:
                 rows.extend(src.fetch_rows(name, gps_start, gps_end, step_s))
-            except src._ChannelNotFound:
+            except ChannelNotFound:
                 self._error(404, f"channel not found in frames: {name}")
                 return
 

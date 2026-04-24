@@ -248,7 +248,7 @@ python scripts/grafana_virgo_source.py --port 8080 \
   `[{"time": <ms>, "name": "<chan>", "value": <float>}, ...]`
 
 `from`/`to` are Unix milliseconds (Grafana's `${__from}` / `${__to}`).
-`step` is in seconds; if omitted, ~1000 points are returned over the window.
+`step_ms` is in milliseconds; if omitted, ~1000 points are returned over the window.
 Multiple channel names can be comma-separated; the response interleaves rows
 from all of them and Grafana Infinity groups by `name` to render one series
 per channel.
@@ -263,15 +263,13 @@ per channel.
 
 ### Grafana Infinity configuration
 - Type = Timeseries, Format = JSON, no root selector
-- URL example: `http://<host>:8080/series?names=${chan}&from=${__from}&to=${__to}&step=${__interval_ms}/1000`
+- URL example: `http://<host>:8080/series?names=${chan}&from=${__from}&to=${__to}&step_ms=${__interval_ms}`
 - Columns: `time` (Time, unit ms), `name` (String), `value` (Number)
 - Group by `name` to produce one series per channel
 
 ### Notes
-- Opening `FrameFile('trend')` takes ~30–60 s at startup; reuse the process.
-- `gps_end` re-reads live, so new data is picked up without restart.
 - Requests are serialised via a lock around `getChannel` — the underlying C
   code is not documented as thread-safe.
-- Rebinning is block-average (NaN-safe) when the requested `step` is coarser
+- Rebinning is block-average (NaN-safe) when the requested `step_ms` is coarser
   than the channel's native sample period; otherwise samples are returned at
   the native rate.
