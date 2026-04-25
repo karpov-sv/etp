@@ -248,10 +248,10 @@ python scripts/grafana_virgo_source.py --port 8080 \
   `[{"time": <ms>, "name": "<chan>", "value": <float>}, ...]`
 
 `from`/`to` are Unix milliseconds (Grafana's `${__from}` / `${__to}`).
-`step_ms` is in milliseconds; if omitted, ~1000 points are returned over the window.
+`step` is also in milliseconds; if omitted, ~1000 points are returned over the window.
 Multiple channel names can be comma-separated; the response interleaves rows
 from all of them and Grafana Infinity groups by `name` to render one series
-per channel.
+per channel. Optionally `source` may also be set to specify per-request data source.
 
 ### Flags
 - `--host` / `--port` (defaults `127.0.0.1:8080`)
@@ -263,7 +263,7 @@ per channel.
 
 ### Grafana Infinity configuration
 - Type = Timeseries, Format = JSON, no root selector
-- URL example: `http://<host>:8080/series?names=${chan}&from=${__from}&to=${__to}&step_ms=${__interval_ms}`
+- URL example: `http://<host>:8080/series?names=${chan}&from=${__from}&to=${__to}&step=${__interval_ms}`
 - Columns: `time` (Time, unit ms), `name` (String), `value` (Number)
 - Group by `name` to produce one series per channel
 

@@ -3,7 +3,7 @@
 Serves time series pulled from a virgotools FrameFile (default source: 'trend').
 Designed to be queried by the Grafana Infinity datasource with an API-style URL:
 
-    /series?names=M1:a,M1:b&from=<unix_ms>&to=<unix_ms>&step_ms=<ms>
+    /series?names=M1:a,M1:b&from=<unix_ms>&to=<unix_ms>&step=<ms>
 
 Response is a list of rows:
 
@@ -101,15 +101,16 @@ class VirgoSource:
         self.max_points = max_points
         self._lock = threading.Lock()
 
-    def fetch_rows(self, name, gps_start, gps_end, step_s):
+    def fetch_rows(self, name, gps_start, gps_end, step_s, source_name=None):
         dur = max(gps_end - gps_start, 0.0)
         if dur == 0:
             return []
 
+        src_name = source_name or self.source_name
         # Serialise: the underlying C code is not documented as thread-safe.
         with self._lock:
             try:
-                vect = getChannel(self.source_name, name, gps_start, dur)
+                vect = getChannel(src_name, name, gps_start, dur)
             except ChannelNotFound:
                 raise
 
@@ -200,19 +201,25 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, "no channel names provided")
             return
 
-        unknown = [n for n in names if src._channel_set and n not in src._channel_set]
-        if unknown:
-            self._error(404, f"unknown channel(s): {','.join(unknown)}")
-            return
+        # Check whether channel name is in the list of known names
+        # Disabled for now as the list is different between data sources
+        # unknown = [n for n in names if src._channel_set and n not in src._channel_set]
+        # if unknown:
+        #     self._error(404, f"unknown channel(s): {','.join(unknown)}")
+        #     return
 
         try:
             t1_ms = int((query.get("to") or [int(time.time() * 1000)])[0])
             default_from = t1_ms - 3600_000
             t0_ms = int((query.get("from") or [default_from])[0])
-            step_s = float((query.get("step_ms") or ["0"])[0])/1000
+            step_s = float((query.get("step") or ["0"])[0])/1000
         except (TypeError, ValueError) as exc:
             self._error(400, f"invalid numeric parameter: {exc}")
             return
+
+        source_override = (query.get("source") or [None])[0]
+        if source_override is not None:
+            source_override = source_override.strip() or None
 
         if t1_ms <= t0_ms:
             self._error(400, "'to' must be greater than 'from'")
@@ -227,7 +234,7 @@ class Handler(BaseHTTPRequestHandler):
         rows = []
         for name in names:
             try:
-                rows.extend(src.fetch_rows(name, gps_start, gps_end, step_s))
+                rows.extend(src.fetch_rows(name, gps_start, gps_end, step_s, source_override))
             except ChannelNotFound:
                 self._error(404, f"channel not found in frames: {name}")
                 return
