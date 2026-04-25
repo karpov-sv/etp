@@ -3,7 +3,7 @@
 Serves time series pulled from a virgotools FrameFile (default source: 'trend').
 Designed to be queried by the Grafana Infinity datasource with an API-style URL:
 
-    /series?names=M1:a,M1:b&from=<unix_ms>&to=<unix_ms>&step=<ms>
+    /series?names=M1:a,M1:b&from=<unix_ms>&to=<unix_ms>&step=<ms>&source=<name>
 
 Response is a list of rows:
 
@@ -43,7 +43,13 @@ except ImportError as exc:
     )
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _load_channels_file(path):
+    """Read a whitelist of channel names, one per line. Lines starting with
+    '#' and blank lines are ignored. Returns [] if the file is missing."""
     if not path or not os.path.exists(path):
         return []
     with open(path) as f:
@@ -51,7 +57,16 @@ def _load_channels_file(path):
 
 
 def unix_ms_to_gps(ms):
+    """Convert a Unix timestamp in milliseconds to GPS seconds."""
     return float(Time(ms / 1000.0, format="unix").gps)
+
+
+def _qs_first(query, key, default=None):
+    """Return the first value for `key` in a parsed query string, or `default`."""
+    values = query.get(key)
+    if not values:
+        return default
+    return values[0]
 
 
 def rebin(values, native_dt, gps_start, step_s):
@@ -70,61 +85,81 @@ def rebin(values, native_dt, gps_start, step_s):
     # can't be inserted inside a single request's time window for trend data).
     gps_offset = float(Time(gps_start, format="gps").unix) - gps_start
 
+    # Native-rate fast path: caller asked for finer or equal resolution than
+    # the data already has, so just emit each sample as-is.
     if step_s <= native_dt:
         t_gps = gps_start + np.arange(n, dtype=np.float64) * native_dt
-        return (1000 * (t_gps + gps_offset)).astype(np.int64, copy=False), values.astype(np.float64, copy=False)
+        t_ms = (1000 * (t_gps + gps_offset)).astype(np.int64, copy=False)
+        return t_ms, values.astype(np.float64, copy=False)
 
+    # How many native samples make up one output bin.
     samples_per_bin = max(1, int(round(step_s / native_dt)))
     trimmed = n - (n % samples_per_bin)
+
+    # Window is shorter than a single bin: fold everything into one point.
     if trimmed == 0:
-        # not even one full bin — return a single-point bin of the mean
         bin_means = np.array([np.nanmean(values)], dtype=np.float64)
         t_gps = np.array([gps_start + (n * native_dt) / 2.0], dtype=np.float64)
-        return (1000 * (t_gps + gps_offset)).astype(np.int64, copy=False), bin_means
+        t_ms = (1000 * (t_gps + gps_offset)).astype(np.int64, copy=False)
+        return t_ms, bin_means
 
+    # Block-average: reshape into (n_bins, samples_per_bin) and take row means.
     reshaped = values[:trimmed].reshape(-1, samples_per_bin).astype(np.float64, copy=False)
     with warnings.catch_warnings():
+        # nanmean of an all-NaN bin warns; we'd rather just get NaN back.
         warnings.simplefilter("ignore", category=RuntimeWarning)
         bin_means = np.nanmean(reshaped, axis=1)
 
+    # Place each bin's timestamp at the centre of the bin.
     bin_dt = samples_per_bin * native_dt
     t_gps = gps_start + (np.arange(bin_means.shape[0], dtype=np.float64) + 0.5) * bin_dt
-    return (1000 * (t_gps + gps_offset)).astype(np.int64, copy=False), bin_means
+    t_ms = (1000 * (t_gps + gps_offset)).astype(np.int64, copy=False)
+    return t_ms, bin_means
 
+
+# ---------------------------------------------------------------------------
+# Data source
+# ---------------------------------------------------------------------------
 
 class VirgoSource:
+    """Wraps virgotools.getChannel with a channel whitelist and a downsampling
+    cap so a single HTTP request can't pull megabytes of samples."""
+
     def __init__(self, source_name, channels_file, max_points):
         print(f"[{time.strftime('%H:%M:%S')}] Will serve data from {source_name!r}", flush=True)
         self.source_name = source_name
         self.channels = _load_channels_file(channels_file)
         self._channel_set = set(self.channels)
         self.max_points = max_points
+        # virgotools' underlying C code is not documented as thread-safe, so
+        # we serialise all getChannel() calls behind this lock.
         self._lock = threading.Lock()
 
     def fetch_rows(self, name, gps_start, gps_end, step_s, source_name=None):
+        """Fetch one channel and return Infinity-style rows. `source_name`
+        overrides the default FrameFile source for this call only."""
         dur = max(gps_end - gps_start, 0.0)
         if dur == 0:
             return []
 
         src_name = source_name or self.source_name
-        # Serialise: the underlying C code is not documented as thread-safe.
         with self._lock:
-            try:
-                vect = getChannel(src_name, name, gps_start, dur)
-            except ChannelNotFound:
-                raise
+            vect = getChannel(src_name, name, gps_start, dur)
 
         native_dt = float(vect.dt)
         v_gps = float(vect.gps)
-        # Enforce the max_points cap by bumping step_s up if needed.
+
+        # Enforce the max_points cap by widening step_s if the request would
+        # otherwise return more points than allowed.
         if self.max_points > 0:
-            n_samples = vect.data.shape[0]
             effective_step = max(step_s, native_dt)
             projected = int(math.ceil(dur / effective_step))
             if projected > self.max_points:
-                effective_step = dur / self.max_points
-                step_s = effective_step
+                step_s = dur / self.max_points
+
         t_ms, values = rebin(vect.data, native_dt, v_gps, step_s)
+
+        # Drop NaN bins (gaps in data); Grafana plots cleanly without them.
         rows = []
         for t, v in zip(t_ms, values):
             if np.isnan(v):
@@ -132,6 +167,10 @@ class VirgoSource:
             rows.append({"time": int(t), "name": name, "value": float(v)})
         return rows
 
+
+# ---------------------------------------------------------------------------
+# HTTP handler
+# ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "VirgoInfinity/0.1"
@@ -159,37 +198,41 @@ class Handler(BaseHTTPRequestHandler):
         src = self.server.source
 
         if path == "/health":
-            ff = FrameFile(src.source_name)
-            self._send_json(200, {
-                "status": "ok",
-                "source": src.source_name,
-                "gps_start": ff.gps_start,
-                "gps_end": ff.gps_end,
-                "channels": len(src.channels),
-            })
-            return
-
-        if path == "/metrics":
-            q = (query.get("q") or [""])[0]
-            try:
-                limit = int((query.get("limit") or ["0"])[0])
-            except ValueError:
-                limit = 0
-            names = src.channels
-            if q:
-                names = [n for n in names if q in n]
-            if limit > 0:
-                names = names[:limit]
-            self._send_json(200, names)
-            return
-
-        if path == "/series":
+            self._handle_health(src)
+        elif path == "/metrics":
+            self._handle_metrics(query, src)
+        elif path == "/series":
             self._handle_series(query, src)
-            return
+        else:
+            self._error(404, f"unknown path: {path}")
 
-        self._error(404, f"unknown path: {path}")
+    def _handle_health(self, src):
+        ff = FrameFile(src.source_name)
+        self._send_json(200, {
+            "status": "ok",
+            "source": src.source_name,
+            "gps_start": ff.gps_start,
+            "gps_end": ff.gps_end,
+            "channels": len(src.channels),
+        })
+
+    def _handle_metrics(self, query, src):
+        """Return the channel whitelist, optionally filtered by substring."""
+        q = _qs_first(query, "q", "")
+        try:
+            limit = int(_qs_first(query, "limit", "0"))
+        except ValueError:
+            limit = 0
+
+        names = src.channels
+        if q:
+            names = [n for n in names if q in n]
+        if limit > 0:
+            names = names[:limit]
+        self._send_json(200, names)
 
     def _handle_series(self, query, src):
+        # 1. Parse channel names (comma-separated, repeatable).
         raw_names = query.get("names") or query.get("name")
         if not raw_names:
             self._error(400, "missing required query parameter: names")
@@ -201,36 +244,40 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, "no channel names provided")
             return
 
-        # Check whether channel name is in the list of known names
-        # Disabled for now as the list is different between data sources
+        # Whitelist check is currently disabled because the channel list
+        # depends on which `source` is being queried, and we only load one.
         # unknown = [n for n in names if src._channel_set and n not in src._channel_set]
         # if unknown:
         #     self._error(404, f"unknown channel(s): {','.join(unknown)}")
         #     return
 
+        # 2. Parse the time window and step. Defaults: last hour, auto-step.
         try:
-            t1_ms = int((query.get("to") or [int(time.time() * 1000)])[0])
-            default_from = t1_ms - 3600_000
-            t0_ms = int((query.get("from") or [default_from])[0])
-            step_s = float((query.get("step") or ["0"])[0])/1000
+            now_ms = int(time.time() * 1000)
+            t1_ms = int(_qs_first(query, "to", now_ms))
+            t0_ms = int(_qs_first(query, "from", t1_ms - 3600_000))
+            step_s = float(_qs_first(query, "step", "0")) / 1000
         except (TypeError, ValueError) as exc:
             self._error(400, f"invalid numeric parameter: {exc}")
             return
-
-        source_override = (query.get("source") or [None])[0]
-        if source_override is not None:
-            source_override = source_override.strip() or None
 
         if t1_ms <= t0_ms:
             self._error(400, "'to' must be greater than 'from'")
             return
 
+        # 3. Optional per-request override of the FrameFile source name.
+        source_override = _qs_first(query, "source")
+        if source_override is not None:
+            source_override = source_override.strip() or None
+
         gps_start = unix_ms_to_gps(t0_ms)
         gps_end = unix_ms_to_gps(t1_ms)
-        # If step not given, target ~1000 points over the window.
+
+        # If step was not specified, target ~1000 points across the window.
         if step_s <= 0:
             step_s = max((gps_end - gps_start) / 1000.0, 0.001)
 
+        # 4. Fetch each requested channel and concatenate the rows.
         rows = []
         for name in names:
             try:
@@ -241,6 +288,10 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_json(200, rows)
 
+
+# ---------------------------------------------------------------------------
+# Server / entry point
+# ---------------------------------------------------------------------------
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
@@ -255,7 +306,8 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--source", default="trend",
-                        help="virgotools FrameFile source (default: trend)")
+                        help="default virgotools FrameFile source; can be "
+                             "overridden per-request via ?source=")
     parser.add_argument("--channels-file", default="channels-list.txt",
                         help="one-channel-per-line whitelist; used for /metrics "
                              "and as a sanity check on /series names")
